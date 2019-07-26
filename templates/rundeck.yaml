@@ -1,0 +1,382 @@
+---
+  kind: "Template"
+  apiVersion: "v1"
+  metadata:
+    name: "rundeck"
+    creationTimestamp: null
+    annotations:
+      description: "Rundeck instance with SSO."
+      tags: "rundeck"
+      # Prevent end users from binding against services provisioned by this template
+      # See: https://docs.okd.io/latest/dev_guide/templates.html#writing-marking-templates-as-bindable
+      template.openshift.io/bindable: "false"
+  labels:
+    template: "rundeck" #this label will applied to all objects created from this template
+  objects:
+  # Add full SSO proxy template. Let's reevaluate how we store this in order to avoid duplicating
+  # the same configuration
+  - kind: "Service"
+    apiVersion: "v1"
+    metadata:
+      name: "cern-sso-proxy"
+    spec:
+      ports:
+        - name: "8081-tcp"
+          protocol: "TCP"
+          port: 8081
+          targetPort: 8081
+      selector:
+        name: "cern-sso-proxy"
+      portalIP: ""
+      type: "ClusterIP"
+      sessionAffinity: "None"
+  - kind: "Route"
+    apiVersion: "v1"
+    metadata:
+      name: "cern-sso-proxy"
+      labels:
+        # This will take of the route registration
+        cern.ch/sso-registration: Shibboleth
+    spec:
+      to:
+        kind: "Service"
+        name: "cern-sso-proxy"
+      port:
+        targetPort: 8081
+      tls:
+        termination: "edge"
+        insecureEdgeTerminationPolicy: Redirect
+  -
+    kind: "ConfigMap"
+    apiVersion: "v1"
+    metadata:
+      name: "cern-sso-proxy"
+    data:
+      # This configMap contains the configurable files a user has to provide to
+      # define the proxy and authorization of the server.
+      # IMPORTANT! For rundeck we sent the username in X-Remote-User instead
+      # of the e-mail address as we normally do
+      authorize.conf: |2
+        # Make sure clients cannot fake authentication by injecting a X-Remote-User header
+        RequestHeader unset X-Remote-User
+        <Location "/">
+          ShibRequestSetting requireSession 1
+          AuthType shibboleth
+          <RequireALL>
+            Require valid-user
+            Require shib-attr ADFS_GROUP ${AUTHORIZED_GROUPS}
+          </RequireALL>
+          # Make the value of REMOTE_USER (the email address) available to the backend
+          # application as HTTP header X-Remote-User
+          #RequestHeader set X-Remote-User %{REMOTE_USER}e
+          # Use the following instead to pass login name rather than email address
+          RequestHeader set X-Remote-User %{ADFS_LOGIN}e
+          # Give role 'admin' to anyone authenticated
+          RequestHeader set REMOTE_USER_GROUPS 'admin'
+        </Location>
+      proxy.conf: |2
+        <Location "/">
+          ProxyPreserveHost On
+          ProxyPass http://${SERVICE_HOST}:${SERVICE_PORT}/
+        </Location>
+  -
+    kind: "ConfigMap"
+    apiVersion: "v1"
+    metadata:
+      name: "cern-sso-shib"
+    data:
+      # The shibboleth2.xml configmap is empty by default so the one from the image
+      # will be taken instead
+      shibboleth2.xml: ""
+  -
+    kind: "DeploymentConfig"
+    apiVersion: "v1"
+    metadata:
+      name: "cern-sso-proxy"
+    spec:
+      strategy:
+        type: "Rolling"
+      triggers:
+      - type: "ConfigChange"
+      - type: "ImageChange"
+        imageChangeParams:
+          automatic: true
+          containerNames:
+          - "shibd"
+          from:
+            kind: "ImageStreamTag"
+            name: "cern-sso-proxy:stable"
+            namespace: openshift
+      - type: "ImageChange"
+        imageChangeParams:
+          automatic: true
+          containerNames:
+          - "httpd"
+          from:
+            kind: "ImageStreamTag"
+            name: "cern-sso-proxy:stable"
+            namespace: openshift
+      replicas: 1
+      selector:
+        name: "cern-sso-proxy"
+      template:
+        metadata:
+          labels:
+            name: "cern-sso-proxy"
+        spec:
+          containers:
+            -
+              name: "httpd"
+              image: "cern-sso-proxy:stable"
+              resources:
+                limits:
+                  cpu: 250m
+                  memory: 100Mi
+                requests:
+                  cpu: 25m
+                  memory: 50Mi
+              volumeMounts:
+                # Shared mount for communication between both containers
+              - mountPath: /var/run/shibboleth
+                name: shared
+                # Mount with apache configurable files
+              - mountPath: /etc/httpd/conf.d/configurable
+                name: apache
+              - mountPath: /tmp/configmap
+                name: shib
+              env:
+              -
+                name: "NAMESPACE"
+                valueFrom:
+                  fieldRef:
+                    apiVersion: v1
+                    fieldPath: metadata.namespace
+              -
+                name: SERVICE_NAME
+                value: "rundeck"
+              -
+                name: HOSTNAME_FQDN
+                value: ""
+              terminationMessagePath: "/dev/termination-log"
+              imagePullPolicy: "IfNotPresent"
+              capabilities: {}
+              securityContext:
+                capabilities: {}
+                privileged: false
+            -
+              name: "shibd"
+              command: # Shibd container has a different entrypoint
+              - /shib.sh
+              image: "cern-sso-proxy:stable"
+              resources:
+                limits:
+                  cpu: 250m
+                  memory: 100Mi
+                requests:
+                  cpu: 25m
+                  memory: 50Mi
+              volumeMounts:
+                # Shared mount for communication between both containers
+              - mountPath: /var/run/shibboleth
+                name: shared
+              - mountPath: /tmp/configmap
+                name: shib
+              env:
+              -
+                name: "NAMESPACE"
+                valueFrom:
+                  fieldRef:
+                    apiVersion: v1
+                    fieldPath: metadata.namespace
+              -
+                name: HOSTNAME_FQDN
+                value: ""
+              terminationMessagePath: "/dev/termination-log"
+              imagePullPolicy: "IfNotPresent"
+              capabilities: {}
+              securityContext:
+                capabilities: {}
+                privileged: false
+          volumes:
+            -
+              emptyDir: {}
+              name: shared
+            - configMap:
+                name: cern-sso-proxy
+              name: apache
+            - configMap:
+                name: cern-sso-shib
+              name: shib
+          restartPolicy: "Always"
+          dnsPolicy: "ClusterFirst"
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: rundeck
+    spec:
+      ports:
+      - name: 4440-tcp
+        port: 4440
+        protocol: TCP
+        targetPort: 4440
+      selector:
+        name: rundeck
+      sessionAffinity: None
+      type: ClusterIP
+  - apiVersion: v1
+    kind: ConfigMap
+    data:
+      rundeck-config.properties: |
+        #loglevel.default is the default log level for jobs: ERROR,WARN,INFO,VERBOSE,DEBUG
+        loglevel.default=INFO
+        rdeck.base=${RDECK_BASE}
+        #SMTP server settings
+        grails.mail.host=cernmx.cern.ch
+
+        #rss.enabled if set to true enables RSS feeds that are public (non-authenticated)
+        rss.enabled=false
+        grails.serverURL=${HOSTNAME_FQDN}
+        grails.mail.default.from=noreply@cern.ch
+        dataSource.dbCreate = update
+        dataSource.url = jdbc:h2:file:/var/rundeck/grailsdb;MVCC=true
+        rundeck.projectsStorageType=db
+
+        # Pre Auth mode settings
+        rundeck.security.authorization.preauthenticated.enabled=true
+        rundeck.security.authorization.preauthenticated.attributeName=REMOTE_USER_GROUPS
+        rundeck.security.authorization.preauthenticated.delimiter=;
+        # Header from which to obtain user name
+        rundeck.security.authorization.preauthenticated.userNameHeader=X-Remote-User
+        # Header from which to obtain list of roles
+        rundeck.security.authorization.preauthenticated.userRolesHeader=REMOTE_USER_GROUPS
+        # Redirect to upstream logout url
+        rundeck.security.authorization.preauthenticated.redirectLogout=true
+        rundeck.security.authorization.preauthenticated.redirectUrl=https://login.cern.ch/adfs/ls/?wa=wsignout1.0
+    metadata:
+      creationTimestamp: null
+      name: rundeck-config
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      creationTimestamp: null
+      name: rundeck-data
+    spec:
+      accessModes:
+      - ReadWriteMany
+      - ReadWriteOnce
+      - ReadOnlyMany
+      resources:
+        requests:
+          storage: 5Gi # We set a size of 5Gi by default
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      annotations:
+        cern.ch/storage-class: standard
+      creationTimestamp: null
+      name: rundeck-logs
+    spec:
+      accessModes:
+      - ReadWriteMany
+      - ReadWriteOnce
+      - ReadOnlyMany
+      resources:
+        requests:
+          storage: 1Gi # We set a size of 1Gi by default
+  - apiVersion: v1
+    kind: DeploymentConfig
+    metadata:
+      name: rundeck
+    spec:
+      replicas: 1
+      selector:
+        name: rundeck
+      strategy:
+        type: Recreate
+      template:
+        metadata:
+          labels:
+            name: rundeck
+        spec:
+          # Some of the components (e.g. ssh, git) used by Rundeck require the current
+          # user to be mapped to a user account. As OpenShift assigns
+          # a random UID, use an initContainer to generate a custom
+          # /etc/passwd with the running UID mapped to the `rundeck` account.
+          initContainers:
+          - command:
+            - bash
+            - -c
+            - sed -e "s/^rundeck:x:[0-9]\+:[0-9]\+:\(.*\)/rundeck:x:$(id -u):0:\1/" /etc/passwd > /etc-custom/passwd
+            # When using an imageStream, the imageChangeParams need to reference the initContainer as well
+            image: rundeck:stable
+            name: passwd
+            volumeMounts:
+            - mountPath: /etc-custom/
+              name: passwd
+          containers:
+          - image: rundeck:stable
+            imagePullPolicy: Always
+            name: rundeck
+            ports:
+            - containerPort: 3000
+              protocol: TCP
+            terminationMessagePath: /dev/termination-log
+            env:
+            - name: "NAMESPACE"
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace
+            - name: 'RDECK_JVM_SETTINGS'
+              value: "-Xmx1024m -Xms256m -XX:MaxPermSize=256m -server" # These are the default values. More info: http://rundeck.org/docs/administration/tuning-rundeck.html
+            resources:
+              limits:
+                cpu: '1'
+                memory: 1.5Gi # 1Gi for the JVM (rundeck) + 1/2Gi for other processes to run as jobs
+              requests:
+                cpu: 250m
+                memory: 512Mi
+            volumeMounts:
+            - mountPath: /rundeck-config
+              name: rundeck-config
+            - mountPath: /var/rundeck
+              name: rundeck-data
+            - mountPath: /var/lib/rundeck/logs
+              name: rundeck-logs
+            - mountPath: /etc/passwd/
+              name: passwd
+              subPath: passwd
+          dnsPolicy: ClusterFirst
+          restartPolicy: Always
+          securityContext: {}
+          terminationGracePeriodSeconds: 30
+          volumes:
+          - configMap:
+              name: rundeck-config
+            name: rundeck-config
+          - name: rundeck-data
+            persistentVolumeClaim:
+              claimName: rundeck-data
+          - name: rundeck-logs
+            persistentVolumeClaim:
+              claimName: rundeck-logs
+          - emptyDir: {}
+            name: passwd
+      triggers:
+      - type: ConfigChange
+      - imageChangeParams:
+          automatic: true
+          containerNames:
+          - rundeck
+          - passwd
+          from:
+            kind: ImageStreamTag
+            name: rundeck:stable
+            namespace: openshift
+        type: ImageChange
+  parameters:
+    -
+      name: "AUTHORIZED_GROUPS"
+      description: "E-group(s) with admin access to the Rundeck instance. It can be more than one if separated by spaces"
+      value: 'it-dep'
+      required: true
