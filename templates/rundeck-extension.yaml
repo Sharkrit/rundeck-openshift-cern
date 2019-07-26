@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: Template
+metadata:
+  name: rundeck-extension
+objects:
+- apiVersion: v1
+  kind: ImageStream
+  metadata:
+    name: custom-rundeck
+  spec: {}
+- apiVersion: v1
+  kind: BuildConfig
+  metadata:
+    name: custom-rundeck
+  spec:
+    output:
+      to:
+        kind: ImageStreamTag
+        name: custom-rundeck:stable
+    runPolicy: Serial
+    source:
+      dockerfile: |
+        FROM gitlab-registry.cern.ch/paas-tools/rundeck-openshift:latest # This will be overriden by the from of the strategy
+        RUN yum install -y ${EXTRA_RPMS} && yum clean all
+      type: Dockerfile
+    strategy:
+      dockerStrategy:
+        from:
+          kind: ImageStreamTag
+          name: rundeck:stable
+          namespace: openshift
+      type: Docker
+    triggers:
+      - type: ConfigChange
+      - type: ImageChange
+parameters:
+-
+  name: "EXTRA_RPMS"
+  description: "Add list of extra RPMs needed by the image, separated by spaces"
+  value: 'git svn python'
+  required: true
